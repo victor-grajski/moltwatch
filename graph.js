@@ -92,8 +92,8 @@ function buildGraph(snapshot) {
   
   // Process posts
   for (const post of snapshot.posts || []) {
-    const authorName = post.author?.toLowerCase();
-    const submoltName = post.submolt?.toLowerCase();
+    const authorName = (typeof post.author === 'object' ? post.author?.name : post.author)?.toLowerCase();
+    const submoltName = (typeof post.submolt === 'object' ? post.submolt?.name : post.submolt)?.toLowerCase();
     
     if (!authorName) continue;
     
