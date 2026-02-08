@@ -783,21 +783,26 @@ app.get('/', (req, res) => {
 
 const fs = require('fs');
 const DATA_DIR = path.join(__dirname, 'data');
-const SCRAPE_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
 const MIN_SCRAPE_INTERVAL = 60 * 60 * 1000; // 1 hour minimum between manual triggers
 
-const { runScrape } = require('./scraper.js');
+const { runScrape, runIncrementalScrape } = require('./scraper.js');
 
+const INCREMENTAL_INTERVAL = 2 * 60 * 60 * 1000;  // 2 hours
+const FULL_SCRAPE_INTERVAL = 24 * 60 * 60 * 1000;  // 24 hours
+
+let lastFullScrape = null;
+let lastIncrementalScrape = null;
 let lastScrapeTime = null;
 let scrapeInProgress = false;
 
-async function scrapeAndRebuild() {
+async function scrapeAndRebuild(mode = 'incremental') {
   if (scrapeInProgress) return { status: 'already_running' };
   scrapeInProgress = true;
   
   try {
-    console.log('🔄 Starting full scrape...');
-    const snapshot = await runScrape();
+    const isFull = mode === 'full';
+    console.log(`🔄 Starting ${isFull ? 'full' : 'incremental'} scrape...`);
+    const snapshot = isFull ? await runScrape() : await runIncrementalScrape();
     
     if (!snapshot || !snapshot.posts || snapshot.posts.length === 0) {
       scrapeInProgress = false;
@@ -811,13 +816,19 @@ async function scrapeAndRebuild() {
     // Trigger rebuild
     loadOrBuildGraph();
     
-    lastScrapeTime = new Date();
+    const now = new Date();
+    lastScrapeTime = now;
+    if (isFull) {
+      lastFullScrape = now;
+    } else {
+      lastIncrementalScrape = now;
+    }
     scrapeInProgress = false;
     
     const snapshotCount = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('snapshot-')).length;
-    console.log(`✅ Full scrape complete: ${snapshot.stats.postsScraped} posts, ${snapshot.stats.commentsScraped} comments, ${snapshot.stats.agentProfilesScraped} profiles`);
+    console.log(`✅ ${isFull ? 'Full' : 'Incremental'} scrape complete: ${snapshot.stats.postsScraped} posts, ${snapshot.stats.commentsScraped} comments, ${snapshot.stats.agentProfilesScraped} profiles`);
     
-    return { status: 'ok', stats: snapshot.stats, snapshots: snapshotCount, timestamp: snapshot.timestamp };
+    return { status: 'ok', mode: isFull ? 'full' : 'incremental', stats: snapshot.stats, snapshots: snapshotCount, timestamp: snapshot.timestamp };
   } catch (e) {
     scrapeInProgress = false;
     console.error('Scrape failed:', e.message);
@@ -833,12 +844,20 @@ app.get('/api/scrape/status', (req, res) => {
   
   res.json({
     lastScrape: lastScrapeTime?.toISOString() || null,
-    nextScrape: lastScrapeTime 
-      ? new Date(lastScrapeTime.getTime() + SCRAPE_INTERVAL).toISOString() 
+    lastFullScrape: lastFullScrape?.toISOString() || null,
+    lastIncrementalScrape: lastIncrementalScrape?.toISOString() || null,
+    nextFullScrape: lastFullScrape 
+      ? new Date(lastFullScrape.getTime() + FULL_SCRAPE_INTERVAL).toISOString() 
       : 'pending startup scrape',
+    nextIncrementalScrape: lastIncrementalScrape 
+      ? new Date(lastIncrementalScrape.getTime() + INCREMENTAL_INTERVAL).toISOString() 
+      : lastFullScrape
+        ? new Date(lastFullScrape.getTime() + INCREMENTAL_INTERVAL).toISOString()
+        : 'pending startup scrape',
     scrapeInProgress,
     snapshotCount,
-    intervalHours: SCRAPE_INTERVAL / 3600000
+    incrementalIntervalHours: INCREMENTAL_INTERVAL / 3600000,
+    fullScrapeIntervalHours: FULL_SCRAPE_INTERVAL / 3600000
   });
 });
 
@@ -848,7 +867,8 @@ app.post('/api/scrape/trigger', async (req, res) => {
     const waitMin = Math.ceil((MIN_SCRAPE_INTERVAL - (Date.now() - lastScrapeTime.getTime())) / 60000);
     return res.status(429).json({ error: `Rate limited. Try again in ${waitMin} minutes.` });
   }
-  const result = await scrapeAndRebuild();
+  const mode = req.query.mode === 'full' ? 'full' : 'incremental';
+  const result = await scrapeAndRebuild(mode);
   res.json(result);
 });
 
@@ -859,11 +879,18 @@ app.listen(PORT, async () => {
   console.log(`📊 Dashboard: http://localhost:${PORT}`);
   console.log(`🔗 API: http://localhost:${PORT}/api/graph`);
   
-  // Initial scrape on startup
-  console.log('🚀 Running initial scrape...');
-  await scrapeAndRebuild();
+  // Initial full scrape on startup
+  console.log('🚀 Running initial full scrape...');
+  await scrapeAndRebuild('full');
   
   // Schedule recurring scrapes
-  setInterval(() => scrapeAndRebuild(), SCRAPE_INTERVAL);
-  console.log(`⏰ Auto-scrape scheduled every ${SCRAPE_INTERVAL / 3600000} hours`);
+  setInterval(() => {
+    // Check if it's time for a full scrape
+    if (!lastFullScrape || Date.now() - lastFullScrape.getTime() >= FULL_SCRAPE_INTERVAL) {
+      scrapeAndRebuild('full');
+    } else {
+      scrapeAndRebuild('incremental');
+    }
+  }, INCREMENTAL_INTERVAL);
+  console.log(`⏰ Incremental scrape every ${INCREMENTAL_INTERVAL / 3600000}h, full scrape every ${FULL_SCRAPE_INTERVAL / 3600000}h`);
 });

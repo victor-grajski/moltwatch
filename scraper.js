@@ -276,6 +276,172 @@ async function runScrape() {
   return snapshot;
 }
 
+// ============ INCREMENTAL SCRAPE ============
+
+async function runIncrementalScrape() {
+  const timestamp = new Date().toISOString();
+  console.log(`\n=== Incremental Moltbook Scrape: ${timestamp} ===\n`);
+
+  // Load existing snapshot to merge into
+  let existing = null;
+  try {
+    const latestMeta = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'latest.json'), 'utf8'));
+    existing = JSON.parse(fs.readFileSync(path.join(DATA_DIR, latestMeta.file), 'utf8'));
+  } catch (_) {}
+
+  if (!existing) {
+    console.log('  No existing snapshot found, falling back to full scrape');
+    return runScrape();
+  }
+
+  // 1. Fetch recent posts (limit 50)
+  console.log('📝 Fetching recent posts...');
+  let recentPosts = [];
+  try {
+    const data = await fetchAPI('/posts', { sort: 'new', limit: 50 });
+    recentPosts = data.posts || [];
+  } catch (e) {
+    console.error('  Error fetching recent posts:', e.message);
+  }
+  console.log(`  ✅ ${recentPosts.length} recent posts fetched`);
+
+  // 2. Comments for recent posts
+  const postComments = await scrapeAllComments(recentPosts);
+
+  // 3. Find new authors not already in snapshot
+  const existingAuthors = new Set(Object.keys(existing.agentProfiles || {}));
+  const newAuthors = new Set();
+  for (const post of recentPosts) {
+    if (post.author?.name && !existingAuthors.has(post.author.name)) {
+      newAuthors.add(post.author.name);
+    }
+  }
+  for (const comments of Object.values(postComments)) {
+    for (const c of comments) {
+      if (c.author?.name && !existingAuthors.has(c.author.name)) {
+        newAuthors.add(c.author.name);
+      }
+    }
+  }
+
+  console.log(`👤 Fetching ${newAuthors.size} new agent profiles...`);
+  const newProfiles = {};
+  for (const name of newAuthors) {
+    try {
+      const data = await fetchAPI('/agents/profile', { name });
+      newProfiles[name] = {
+        name: data.name || name,
+        karma: data.karma,
+        follower_count: data.follower_count,
+        following_count: data.following_count,
+        created_at: data.created_at,
+      };
+    } catch (e) {
+      newProfiles[name] = { name, error: e.message };
+    }
+    await sleep(RATE_LIMIT_MS);
+  }
+
+  // 4. Update submolts
+  const submolts = await scrapeSubmolts();
+
+  // 5. Merge: add new posts, update existing posts if they appear in recent
+  const existingPostMap = new Map();
+  for (const p of existing.posts) {
+    existingPostMap.set(p.id, p);
+  }
+
+  const recentFormatted = recentPosts.map(p => ({
+    id: p.id,
+    title: p.title,
+    submolt: p.submolt?.name,
+    author: p.author?.name,
+    upvotes: p.upvote_count,
+    comment_count: p.comment_count,
+    created: p.created_at,
+    comments: postComments[p.id] ? postComments[p.id].map(c => ({
+      id: c.id,
+      author: c.author?.name,
+      body: c.body || c.content,
+      upvotes: c.upvote_count,
+      created: c.created_at,
+    })) : [],
+  }));
+
+  // Overwrite/add recent posts into existing
+  for (const p of recentFormatted) {
+    existingPostMap.set(p.id, p);
+  }
+
+  const mergedPosts = Array.from(existingPostMap.values())
+    .sort((a, b) => new Date(b.created) - new Date(a.created));
+
+  // Merge profiles
+  const mergedProfiles = { ...existing.agentProfiles, ...newProfiles };
+
+  // Categorize submolts
+  const nowMs = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const active24h = submolts.filter(s =>
+    s.last_activity_at && (nowMs - new Date(s.last_activity_at).getTime()) < day
+  );
+  const active7d = submolts.filter(s =>
+    s.last_activity_at && (nowMs - new Date(s.last_activity_at).getTime()) < 7 * day
+  );
+
+  // Build heatmap from merged posts
+  const mergedPostComments = {};
+  for (const p of mergedPosts) {
+    if (p.comments && p.comments.length > 0) {
+      mergedPostComments[p.id] = p.comments;
+    }
+  }
+  const heatmapData = buildHeatmapData(
+    mergedPosts.map(p => ({ created_at: p.created })),
+    mergedPostComments
+  );
+
+  const snapshot = {
+    timestamp,
+    stats: {
+      totalSubmolts: submolts.length,
+      active24h: active24h.length,
+      active7d: active7d.length,
+      postsScraped: mergedPosts.length,
+      commentsScraped: mergedPosts.reduce((sum, p) => sum + (p.comments?.length || 0), 0),
+      agentProfilesScraped: Object.keys(mergedProfiles).length,
+      incrementalNewPosts: recentPosts.length,
+      incrementalNewProfiles: newAuthors.size,
+    },
+    submolts: submolts.map(s => ({
+      name: s.name,
+      display_name: s.display_name,
+      subscribers: s.subscriber_count,
+      last_activity: s.last_activity_at,
+      created: s.created_at
+    })),
+    posts: mergedPosts,
+    agentProfiles: mergedProfiles,
+    heatmapData,
+  };
+
+  // Save
+  const now = new Date();
+  const filename = `snapshot-${now.toISOString().replace(/[:.]/g, '-').slice(0, 16)}.json`;
+  fs.writeFileSync(path.join(DATA_DIR, filename), JSON.stringify(snapshot));
+  fs.writeFileSync(path.join(DATA_DIR, 'latest.json'), JSON.stringify({
+    timestamp,
+    file: filename,
+    stats: snapshot.stats
+  }, null, 2));
+
+  console.log(`\n✅ Incremental snapshot saved: ${filename}`);
+  console.log(`   Merged posts: ${mergedPosts.length}, New profiles: ${newAuthors.size}`);
+  console.log('\n=== Incremental scrape complete ===\n');
+
+  return snapshot;
+}
+
 // Run if called directly
 if (require.main === module) {
   runScrape().catch(e => {
@@ -284,4 +450,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runScrape, fetchAPI, scrapeSubmolts, scrapeAllPosts, scrapeAllComments, scrapeAgentProfiles, buildHeatmapData };
+module.exports = { runScrape, runIncrementalScrape, fetchAPI, scrapeSubmolts, scrapeAllPosts, scrapeAllComments, scrapeAgentProfiles, buildHeatmapData };
