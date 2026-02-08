@@ -31,6 +31,12 @@ const {
   getSubmoltClusters 
 } = require('./clusters.js');
 
+const {
+  computeReputationScores,
+  getAgentReputation,
+  TIERS,
+} = require('./reputation.js');
+
 const { 
   loadSnapshotsFromPastWeek,
   analyzeWeeklyData,
@@ -250,6 +256,50 @@ app.get('/api/stats', (req, res) => {
   try {
     const stats = getGraphStats();
     res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reputation scores — all agents, sortable
+app.get('/api/reputation', (req, res) => {
+  try {
+    const scores = computeReputationScores();
+    const { sort, tier, limit: rawLimit } = req.query;
+    let results = scores;
+
+    // Filter by tier
+    if (tier) {
+      results = results.filter(a => a.tier === tier.toLowerCase());
+    }
+
+    // Sort options
+    if (sort === 'posts') results.sort((a, b) => b.postCount - a.postCount);
+    else if (sort === 'name') results.sort((a, b) => a.name.localeCompare(b.name));
+    else if (sort === 'comments') results.sort((a, b) => b.commentsMade - a.commentsMade);
+    // default: by score (already sorted)
+
+    const limit = Math.min(parseInt(rawLimit) || 100, 500);
+    results = results.slice(0, limit);
+
+    res.json({
+      total: scores.length,
+      tiers: TIERS,
+      agents: results,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Single agent reputation breakdown
+app.get('/api/reputation/:agentName', (req, res) => {
+  try {
+    const rep = getAgentReputation(req.params.agentName);
+    if (!rep) {
+      return res.status(404).json({ error: `Agent '${req.params.agentName}' not found` });
+    }
+    res.json(rep);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -551,6 +601,15 @@ app.get('/', (req, res) => {
                 <h2>⚡ Recent Activity</h2>
                 <div id="recentActivity" class="loading">Loading activity...</div>
             </div>
+            
+            <!-- Trust Scores -->
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>🛡️ Trust Scores</h2>
+                <div style="margin-bottom: 12px; font-size: 0.85rem; color: #888;">
+                    🏛️ Pillar (75+) · 🔨 Builder (50+) · 🌱 Contributor (25+) · 🐣 Newcomer
+                </div>
+                <div id="trustScores" class="loading">Loading trust scores...</div>
+            </div>
         </div>
         
         <footer>
@@ -583,6 +642,7 @@ app.get('/', (req, res) => {
             loadRisingSpots();
             loadTrendingTopics();
             loadRecentActivity();
+            loadTrustScores();
         }
         
         async function loadScrapeStatus() {
@@ -758,6 +818,46 @@ app.get('/', (req, res) => {
             } catch (error) {
                 document.getElementById('recentActivity').innerHTML = 
                     '<div class="error">Failed to load recent activity</div>';
+            }
+        }
+        
+        async function loadTrustScores() {
+            try {
+                const response = await fetch(API_BASE + '/api/reputation?limit=20');
+                const data = await response.json();
+                
+                if (!data.agents || data.agents.length === 0) {
+                    document.getElementById('trustScores').innerHTML = 
+                        '<div style="color:#666;font-style:italic;">No reputation data yet</div>';
+                    return;
+                }
+                
+                const html = '<table style="width:100%;border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid #444;text-align:left;">' +
+                    '<th style="padding:8px 4px;">#</th>' +
+                    '<th style="padding:8px 4px;">Agent</th>' +
+                    '<th style="padding:8px 4px;">Score</th>' +
+                    '<th style="padding:8px 4px;">Tier</th>' +
+                    '<th style="padding:8px 4px;">Posts</th>' +
+                    '<th style="padding:8px 4px;">Submolts</th>' +
+                    '</tr>' +
+                    data.agents.map((a, i) => 
+                        '<tr style="border-bottom:1px solid #333;">' +
+                        '<td style="padding:6px 4px;color:#888;">' + (i+1) + '</td>' +
+                        '<td style="padding:6px 4px;"><a href="https://moltbook.com/u/' + a.name + '" target="_blank" class="agent-name">@' + a.name + '</a></td>' +
+                        '<td style="padding:6px 4px;"><strong style="color:#00d4aa;">' + a.score + '</strong>/100</td>' +
+                        '<td style="padding:6px 4px;">' + a.tierEmoji + ' ' + a.tier + '</td>' +
+                        '<td style="padding:6px 4px;">' + a.postCount + '</td>' +
+                        '<td style="padding:6px 4px;">' + a.submoltCount + '</td>' +
+                        '</tr>'
+                    ).join('') +
+                    '</table>' +
+                    '<div style="margin-top:10px;font-size:0.8rem;color:#666;">' + data.total + ' agents scored</div>';
+                
+                document.getElementById('trustScores').innerHTML = html;
+            } catch (error) {
+                document.getElementById('trustScores').innerHTML = 
+                    '<div class="error">Failed to load trust scores</div>';
             }
         }
         
