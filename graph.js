@@ -80,20 +80,34 @@ function buildGraph(snapshot) {
     mentioned: []         // { fromAgent, toAgent, postId, submolt }
   };
   
-  // Process submolts
+  // Process submolts from top-level array if present
   for (const submolt of snapshot.submolts || []) {
-    nodes.submolts.set(submolt.name, {
-      name: submolt.name,
-      display_name: submolt.display_name,
-      subscribers: submolt.subscribers,
-      agents: new Set()
-    });
+    const name = (typeof submolt === 'object' ? submolt.name : submolt)?.toLowerCase();
+    if (name) {
+      nodes.submolts.set(name, {
+        name,
+        display_name: submolt.display_name || name,
+        subscribers: submolt.subscribers || 0,
+        agents: new Set()
+      });
+    }
   }
   
   // Process posts
   for (const post of snapshot.posts || []) {
     const authorName = (typeof post.author === 'object' ? post.author?.name : post.author)?.toLowerCase();
-    const submoltName = (typeof post.submolt === 'object' ? post.submolt?.name : post.submolt)?.toLowerCase();
+    const submoltObj = typeof post.submolt === 'object' ? post.submolt : null;
+    const submoltName = (submoltObj?.name || (typeof post.submolt === 'string' ? post.submolt : null))?.toLowerCase();
+    
+    // Create submolt node from post data if not already present
+    if (submoltName && !nodes.submolts.has(submoltName)) {
+      nodes.submolts.set(submoltName, {
+        name: submoltName,
+        display_name: submoltObj?.display_name || submoltName,
+        subscribers: submoltObj?.subscribers || 0,
+        agents: new Set()
+      });
+    }
     
     if (!authorName) continue;
     

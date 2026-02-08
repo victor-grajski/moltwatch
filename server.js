@@ -754,10 +754,113 @@ app.get('/', (req, res) => {
   res.send(dashboardHTML);
 });
 
+// ============ AUTO-SCRAPING ============
+
+const fs = require('fs');
+const DATA_DIR = path.join(__dirname, 'data');
+const MOLTBOOK_API = 'https://www.moltbook.com/api/v1';
+const SCRAPE_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
+const MIN_SCRAPE_INTERVAL = 60 * 60 * 1000; // 1 hour minimum between manual triggers
+
+let lastScrapeTime = null;
+let scrapeInProgress = false;
+
+async function scrapeAndRebuild() {
+  if (scrapeInProgress) return { status: 'already_running' };
+  scrapeInProgress = true;
+  
+  try {
+    console.log('🔄 Starting scrape...');
+    let allPosts = [];
+    
+    for (let offset = 0; offset < 500; offset += 50) {
+      try {
+        const res = await fetch(`${MOLTBOOK_API}/posts?sort=new&limit=50&offset=${offset}`);
+        const data = await res.json();
+        if (!data.posts || !data.posts.length) break;
+        allPosts = allPosts.concat(data.posts);
+        if (!data.has_more) break;
+      } catch (e) {
+        console.error(`Scrape error at offset ${offset}:`, e.message);
+        break;
+      }
+    }
+    
+    if (allPosts.length === 0) {
+      scrapeInProgress = false;
+      return { status: 'error', message: 'No posts fetched' };
+    }
+    
+    // Save snapshot with hour to avoid overwriting
+    const now = new Date();
+    const ts = now.toISOString();
+    const filename = `snapshot-${now.toISOString().replace(/[:.]/g, '-').slice(0, 16)}.json`;
+    const snapshot = { timestamp: ts, posts: allPosts, stats: { postsScraped: allPosts.length } };
+    
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(DATA_DIR, filename), JSON.stringify(snapshot));
+    fs.writeFileSync(path.join(DATA_DIR, 'latest.json'), JSON.stringify({ timestamp: ts, file: filename, stats: snapshot.stats }));
+    
+    // Force rebuild graph by deleting cached graph
+    const graphPath = path.join(DATA_DIR, 'graph.json');
+    if (fs.existsSync(graphPath)) fs.unlinkSync(graphPath);
+    
+    // Trigger rebuild
+    loadOrBuildGraph();
+    
+    lastScrapeTime = now;
+    scrapeInProgress = false;
+    
+    const snapshotCount = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('snapshot-')).length;
+    console.log(`✅ Scrape complete: ${allPosts.length} posts, ${snapshotCount} total snapshots`);
+    
+    return { status: 'ok', posts: allPosts.length, snapshots: snapshotCount, timestamp: ts };
+  } catch (e) {
+    scrapeInProgress = false;
+    console.error('Scrape failed:', e.message);
+    return { status: 'error', message: e.message };
+  }
+}
+
+// Scrape status endpoint
+app.get('/api/scrape/status', (req, res) => {
+  const snapshotCount = fs.existsSync(DATA_DIR) 
+    ? fs.readdirSync(DATA_DIR).filter(f => f.startsWith('snapshot-')).length 
+    : 0;
+  
+  res.json({
+    lastScrape: lastScrapeTime?.toISOString() || null,
+    nextScrape: lastScrapeTime 
+      ? new Date(lastScrapeTime.getTime() + SCRAPE_INTERVAL).toISOString() 
+      : 'pending startup scrape',
+    scrapeInProgress,
+    snapshotCount,
+    intervalHours: SCRAPE_INTERVAL / 3600000
+  });
+});
+
+// Manual scrape trigger
+app.post('/api/scrape/trigger', async (req, res) => {
+  if (lastScrapeTime && Date.now() - lastScrapeTime.getTime() < MIN_SCRAPE_INTERVAL) {
+    const waitMin = Math.ceil((MIN_SCRAPE_INTERVAL - (Date.now() - lastScrapeTime.getTime())) / 60000);
+    return res.status(429).json({ error: `Rate limited. Try again in ${waitMin} minutes.` });
+  }
+  const result = await scrapeAndRebuild();
+  res.json(result);
+});
+
 // ============ SERVER STARTUP ============
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🔬 MoltWatch server running on port ${PORT}`);
   console.log(`📊 Dashboard: http://localhost:${PORT}`);
   console.log(`🔗 API: http://localhost:${PORT}/api/graph`);
+  
+  // Initial scrape on startup
+  console.log('🚀 Running initial scrape...');
+  await scrapeAndRebuild();
+  
+  // Schedule recurring scrapes
+  setInterval(() => scrapeAndRebuild(), SCRAPE_INTERVAL);
+  console.log(`⏰ Auto-scrape scheduled every ${SCRAPE_INTERVAL / 3600000} hours`);
 });
