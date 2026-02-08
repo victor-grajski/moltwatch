@@ -174,18 +174,43 @@ app.get('/api/clusters', (req, res) => {
   }
 });
 
-// Activity heatmap (simplified for now)
+// Activity heatmap — real data from latest snapshot
 app.get('/api/heatmap', (req, res) => {
   try {
-    // For now, return basic activity data from graph
     const graph = loadOrBuildGraph();
-    
-    // Generate hourly activity mock data (would be improved with real heatmap module)
-    const hourlyActivity = Array.from({ length: 24 }, (_, hour) => ({
-      hour,
-      activity: Math.floor(Math.random() * 100) // Mock data for now
-    }));
-    
+
+    // Try to load heatmap data from latest snapshot
+    let hourlyActivity;
+    try {
+      const latestMeta = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'latest.json'), 'utf8'));
+      const snapshot = JSON.parse(fs.readFileSync(path.join(DATA_DIR, latestMeta.file), 'utf8'));
+      if (snapshot.heatmapData && snapshot.heatmapData.length === 24) {
+        hourlyActivity = snapshot.heatmapData;
+      }
+    } catch (_) { /* fall through */ }
+
+    // Fallback: compute from snapshot posts/comments if heatmapData not present
+    if (!hourlyActivity) {
+      try {
+        const latestMeta = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'latest.json'), 'utf8'));
+        const snapshot = JSON.parse(fs.readFileSync(path.join(DATA_DIR, latestMeta.file), 'utf8'));
+        const counts = new Array(24).fill(0);
+        if (snapshot.posts) {
+          for (const p of snapshot.posts) {
+            if (p.created) counts[new Date(p.created).getUTCHours()]++;
+            if (p.comments) {
+              for (const c of p.comments) {
+                if (c.created) counts[new Date(c.created).getUTCHours()]++;
+              }
+            }
+          }
+        }
+        hourlyActivity = counts.map((activity, hour) => ({ hour, activity }));
+      } catch (_) {
+        hourlyActivity = Array.from({ length: 24 }, (_, hour) => ({ hour, activity: 0 }));
+      }
+    }
+
     const submoltActivity = graph.nodes.submolts
       .map(s => ({
         name: s.name,
@@ -195,7 +220,7 @@ app.get('/api/heatmap', (req, res) => {
       }))
       .sort((a, b) => b.agentCount - a.agentCount)
       .slice(0, 20);
-    
+
     res.json({
       hourlyActivity,
       submoltActivity
@@ -758,9 +783,10 @@ app.get('/', (req, res) => {
 
 const fs = require('fs');
 const DATA_DIR = path.join(__dirname, 'data');
-const MOLTBOOK_API = 'https://www.moltbook.com/api/v1';
 const SCRAPE_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
 const MIN_SCRAPE_INTERVAL = 60 * 60 * 1000; // 1 hour minimum between manual triggers
+
+const { runScrape } = require('./scraper.js');
 
 let lastScrapeTime = null;
 let scrapeInProgress = false;
@@ -770,36 +796,13 @@ async function scrapeAndRebuild() {
   scrapeInProgress = true;
   
   try {
-    console.log('🔄 Starting scrape...');
-    let allPosts = [];
+    console.log('🔄 Starting full scrape...');
+    const snapshot = await runScrape();
     
-    for (let offset = 0; offset < 500; offset += 50) {
-      try {
-        const res = await fetch(`${MOLTBOOK_API}/posts?sort=new&limit=50&offset=${offset}`);
-        const data = await res.json();
-        if (!data.posts || !data.posts.length) break;
-        allPosts = allPosts.concat(data.posts);
-        if (!data.has_more) break;
-      } catch (e) {
-        console.error(`Scrape error at offset ${offset}:`, e.message);
-        break;
-      }
-    }
-    
-    if (allPosts.length === 0) {
+    if (!snapshot || !snapshot.posts || snapshot.posts.length === 0) {
       scrapeInProgress = false;
       return { status: 'error', message: 'No posts fetched' };
     }
-    
-    // Save snapshot with hour to avoid overwriting
-    const now = new Date();
-    const ts = now.toISOString();
-    const filename = `snapshot-${now.toISOString().replace(/[:.]/g, '-').slice(0, 16)}.json`;
-    const snapshot = { timestamp: ts, posts: allPosts, stats: { postsScraped: allPosts.length } };
-    
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(path.join(DATA_DIR, filename), JSON.stringify(snapshot));
-    fs.writeFileSync(path.join(DATA_DIR, 'latest.json'), JSON.stringify({ timestamp: ts, file: filename, stats: snapshot.stats }));
     
     // Force rebuild graph by deleting cached graph
     const graphPath = path.join(DATA_DIR, 'graph.json');
@@ -808,13 +811,13 @@ async function scrapeAndRebuild() {
     // Trigger rebuild
     loadOrBuildGraph();
     
-    lastScrapeTime = now;
+    lastScrapeTime = new Date();
     scrapeInProgress = false;
     
     const snapshotCount = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('snapshot-')).length;
-    console.log(`✅ Scrape complete: ${allPosts.length} posts, ${snapshotCount} total snapshots`);
+    console.log(`✅ Full scrape complete: ${snapshot.stats.postsScraped} posts, ${snapshot.stats.commentsScraped} comments, ${snapshot.stats.agentProfilesScraped} profiles`);
     
-    return { status: 'ok', posts: allPosts.length, snapshots: snapshotCount, timestamp: ts };
+    return { status: 'ok', stats: snapshot.stats, snapshots: snapshotCount, timestamp: snapshot.timestamp };
   } catch (e) {
     scrapeInProgress = false;
     console.error('Scrape failed:', e.message);
