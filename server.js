@@ -498,11 +498,16 @@ app.get('/', (req, res) => {
         <header>
             <h1>🔬 MoltWatch</h1>
             <p class="subtitle">Real-time Moltbook ecosystem analytics</p>
+            <div id="scrapeStatus" style="margin-top: 10px; font-size: 0.85rem; color: #888;"></div>
         </header>
         
         <div class="search-box">
             <input type="text" id="agentSearch" placeholder="Search agent (e.g., SparkOC)" />
             <button onclick="searchAgent()">Lookup Agent</button>
+        </div>
+        
+        <div class="search-box">
+            <input type="text" id="submoltFilter" placeholder="Filter submolts..." oninput="filterSubmolts()" />
         </div>
         
         <div id="agentDetail" class="agent-detail">
@@ -559,16 +564,39 @@ app.get('/', (req, res) => {
     <script>
         // API Base URL
         const API_BASE = '';
+        const REFRESH_INTERVAL = 60000; // 60 seconds
+        
+        // Cache for filtering
+        let cachedSubmolts = [];
         
         // Load initial data
         window.addEventListener('load', () => {
+            refreshAll();
+            setInterval(refreshAll, REFRESH_INTERVAL);
+        });
+        
+        function refreshAll() {
+            loadScrapeStatus();
             loadEcosystemStats();
             loadTopAgents();
             loadTopSubmolts();
             loadRisingSpots();
             loadTrendingTopics();
             loadRecentActivity();
-        });
+        }
+        
+        async function loadScrapeStatus() {
+            try {
+                const response = await fetch(API_BASE + '/api/scrape/status');
+                const data = await response.json();
+                const el = document.getElementById('scrapeStatus');
+                const lastScraped = data.lastScrape 
+                    ? new Date(data.lastScrape).toLocaleString() 
+                    : 'Never';
+                const status = data.scrapeInProgress ? ' ⏳ Scrape in progress...' : '';
+                el.innerHTML = '🕐 Last scraped: <strong>' + lastScraped + '</strong>' + status + ' · Auto-refreshes every 60s';
+            } catch (_) {}
+        }
         
         // Handle Enter key in search
         document.getElementById('agentSearch').addEventListener('keypress', (e) => {
@@ -631,20 +659,36 @@ app.get('/', (req, res) => {
             try {
                 const response = await fetch(API_BASE + '/api/graph');
                 const data = await response.json();
-                
-                const html = data.topSubmolts.map(submolt => \`
-                    <div class="list-item">
-                        <a href="https://moltbook.com/m/\${submolt.name}" 
-                           target="_blank" class="submolt-name">m/\${submolt.display_name || submolt.name}</a>
-                        <span class="count">\${submolt.agentCount} agents</span>
-                    </div>
-                \`).join('');
-                
-                document.getElementById('topSubmolts').innerHTML = html;
+                cachedSubmolts = data.topSubmolts;
+                renderSubmolts(cachedSubmolts);
             } catch (error) {
                 document.getElementById('topSubmolts').innerHTML = 
                     '<div class="error">Failed to load top submolts</div>';
             }
+        }
+        
+        function renderSubmolts(submolts) {
+            const html = submolts.map(submolt => \`
+                <div class="list-item">
+                    <a href="https://moltbook.com/m/\${submolt.name}" 
+                       target="_blank" class="submolt-name">m/\${submolt.display_name || submolt.name}</a>
+                    <span class="count">\${submolt.agentCount} agents</span>
+                </div>
+            \`).join('');
+            document.getElementById('topSubmolts').innerHTML = html || '<div style="color:#666;font-style:italic;">No matches</div>';
+        }
+        
+        function filterSubmolts() {
+            const query = document.getElementById('submoltFilter').value.toLowerCase().trim();
+            if (!query) {
+                renderSubmolts(cachedSubmolts);
+                return;
+            }
+            const filtered = cachedSubmolts.filter(s => 
+                (s.display_name || s.name).toLowerCase().includes(query) ||
+                s.name.toLowerCase().includes(query)
+            );
+            renderSubmolts(filtered);
         }
         
         async function loadRisingSpots() {
